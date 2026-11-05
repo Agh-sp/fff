@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 
-use log::debug;
+use log::{debug, warn};
 
 use memflow::prelude::v1::*;
 
@@ -13,6 +13,7 @@ use crate::memory::address;
 use crate::memory::validation::TraversalGuard;
 use crate::source2::InterfaceReg;
 
+use super::interface_factory::{FactoryResult, resolve_factory};
 use super::interface_policy::module_result;
 
 pub type InterfaceMap = BTreeMap<String, BTreeMap<String, umem>>;
@@ -86,32 +87,44 @@ fn read_interfaces(
                 format!("failed to read interface name at {:?}", reg.name.address())
             })?;
 
-        let instance_addr =
-            address::resolve_rip(mem, reg.create_fn.address()).with_context(|| {
-                format!(
-                    "failed to resolve factory for {name:?} at {:?}",
-                    reg.create_fn.address()
-                )
-            })?;
-
         ensure!(!name.is_empty(), "empty interfaces name");
-        let instance_rva = instance_addr
-            .to_umem()
-            .checked_sub(module.base.to_umem())
-            .ok_or_else(|| anyhow::anyhow!("interfaces address precedes module base"))?;
-        ensure!(
-            instance_rva < module.size as umem,
-            "interfaces address outside module"
-        );
-        debug!(
-            "found \"{}\" at {:#X} ({} + {:#X})",
-            name,
-            instance_addr.to_umem(),
-            module.name,
-            instance_rva
-        );
+        let factory = reg.create_fn.address();
+        let resolved = resolve_factory(
+            module.base.to_umem() as u64,
+            module.size as u64,
+            factory.to_umem() as u64,
+            |address, bytes| {
+                mem.read_raw_into(address.into(), bytes).data()?;
+                Ok(())
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to resolve interface {name:?} in {} at factory {factory:?}",
+                module.name
+            )
+        })?;
 
-        result.insert(name, instance_rva);
+        match resolved {
+            FactoryResult::Static(rva) => {
+                debug!(
+                    "found {:?} at {:#X} ({} + {:#X})",
+                    name,
+                    module.base.to_umem() + rva as umem,
+                    module.name,
+                    rva
+                );
+                result.insert(name, rva as umem);
+            }
+            FactoryResult::Omitted(reason) => {
+                // Keep valid entries and continue via the registration's next
+                // pointer, not through arbitrary factory machine code.
+                warn!(
+                    "omitting interface {name:?} in {} (factory {factory:?}): {reason}",
+                    module.name
+                );
+            }
+        }
 
         reg_ptr = reg.next;
     }
