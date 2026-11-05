@@ -8,7 +8,7 @@ use serde_json::json;
 use super::{CodeWriter, Formatter, SchemaMap, slugify, zig_ident};
 
 use super::enum_value::{format_enum_member_value, unsigned_enum_value};
-use crate::analysis::ClassMetadata;
+use crate::analysis::{Class, ClassMetadata};
 
 impl CodeWriter for SchemaMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -58,11 +58,7 @@ impl CodeWriter for SchemaMap {
                         }
 
                         for class in classes {
-                            let parent_name = class
-                                .parent_name
-                                .as_deref()
-                                .map(slugify)
-                                .unwrap_or("None".to_string());
+                            let parent_name = parent_label(class);
 
                             writeln!(fmt, "// Parent: {}", parent_name)?;
                             writeln!(fmt, "// Field count: {}", class.fields.len())?;
@@ -147,11 +143,7 @@ impl CodeWriter for SchemaMap {
                             }
 
                             for class in classes {
-                                let parent_name = class
-                                    .parent_name
-                                    .as_deref()
-                                    .map(slugify)
-                                    .unwrap_or("None".to_string());
+                                let parent_name = parent_label(class);
 
                                 writeln!(fmt, "// Parent: {}", parent_name)?;
                                 writeln!(fmt, "// Field count: {}", class.fields.len())?;
@@ -218,14 +210,17 @@ impl CodeWriter for SchemaMap {
                             })
                             .collect();
 
-                        (
-                            slugify(&class.name),
-                            json!({
-                                "parent": class.parent_name,
-                                "fields": fields,
-                                "metadata": metadata
-                            }),
-                        )
+                        let mut entry = json!({
+                            "parent": class.parent_name,
+                            "fields": fields,
+                            "metadata": metadata
+                        });
+                        // null without an error means no parent; null with an
+                        // error means inheritance is unknown, not absent.
+                        if let Some(error) = &class.parent_error {
+                            entry["parent_error"] = json!(error);
+                        }
+                        (slugify(&class.name), entry)
                     })
                     .collect();
 
@@ -340,11 +335,7 @@ impl CodeWriter for SchemaMap {
                             }
 
                             for class in classes {
-                                let parent_name = class
-                                    .parent_name
-                                    .as_deref()
-                                    .map(slugify)
-                                    .unwrap_or("None".to_string());
+                                let parent_name = parent_label(class);
 
                                 writeln!(fmt, "// Parent: {}", parent_name)?;
                                 writeln!(fmt, "// Field count: {}", class.fields.len())?;
@@ -444,11 +435,7 @@ impl CodeWriter for SchemaMap {
                             }
 
                             for class in classes {
-                                let parent_name = class
-                                    .parent_name
-                                    .as_deref()
-                                    .map(slugify)
-                                    .unwrap_or("None".to_string());
+                                let parent_name = parent_label(class);
 
                                 writeln!(fmt, "// Parent: {}", parent_name)?;
                                 writeln!(fmt, "// Field count: {}", class.fields.len())?;
@@ -487,6 +474,18 @@ impl CodeWriter for SchemaMap {
     }
 }
 
+fn parent_label(class: &Class) -> String {
+    if class.parent_error.is_some() {
+        "UNRESOLVED (see parent_error in JSON or the log)".to_string()
+    } else {
+        class
+            .parent_name
+            .as_deref()
+            .map(slugify)
+            .unwrap_or_else(|| "None".to_string())
+    }
+}
+
 fn write_metadata(fmt: &mut Formatter<'_>, metadata: &[ClassMetadata]) -> fmt::Result {
     if metadata.is_empty() {
         return Ok(());
@@ -516,6 +515,88 @@ fn write_metadata(fmt: &mut Formatter<'_>, metadata: &[ClassMetadata]) -> fmt::R
 mod tests {
     use super::*;
     use crate::analysis::{Enum, EnumMember};
+
+    fn parent_fixture() -> SchemaMap {
+        let class = |name: &str, parent: Option<&str>, error: Option<&str>| Class {
+            name: name.into(),
+            module_name: "test.dll".into(),
+            parent_name: parent.map(str::to_string),
+            parent_error: error.map(str::to_string),
+            fields: vec![crate::analysis::ClassField {
+                name: "m_value".into(),
+                type_name: "int32".into(),
+                offset: 16,
+            }],
+            metadata: vec![],
+        };
+        SchemaMap::from([(
+            "test.dll".into(),
+            (
+                vec![
+                    class("Root", None, None),
+                    class("Child", Some("Root"), None),
+                    class("Unresolved", None, Some("invalid parent class name")),
+                ],
+                vec![],
+            ),
+        )])
+    }
+
+    #[test]
+    fn json_distinguishes_absent_and_unresolved_parents_without_losing_fields() {
+        let schemas = parent_fixture();
+        let mut text = String::new();
+        schemas
+            .write_json(&mut Formatter::new(&mut text, 4))
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let classes = &output["test.dll"]["classes"];
+        assert!(classes["Root"]["parent"].is_null());
+        assert!(classes["Root"].get("parent_error").is_none());
+        assert_eq!(classes["Child"]["parent"], "Root");
+        assert!(classes["Child"].get("parent_error").is_none());
+        assert!(classes["Unresolved"]["parent"].is_null());
+        assert_eq!(
+            classes["Unresolved"]["parent_error"],
+            "invalid parent class name"
+        );
+        assert_eq!(classes["Unresolved"]["fields"]["m_value"], 16);
+    }
+
+    #[test]
+    fn generated_code_marks_unresolved_parent_metadata() {
+        let schemas = parent_fixture();
+        for extension in ["cs", "hpp", "rs", "zig"] {
+            let mut text = String::new();
+            let mut fmt = Formatter::new(&mut text, 4);
+            super::super::Item::Schemas(&schemas)
+                .write(&mut fmt, extension)
+                .unwrap();
+            assert!(
+                text.contains("// Parent: UNRESOLVED"),
+                "{extension}: {text}"
+            );
+            assert!(text.contains("// Parent: None"));
+            assert!(text.contains("// Parent: Root"));
+            assert_eq!(text.matches("m_value").count(), 3);
+        }
+    }
+
+    #[test]
+    fn old_class_serializations_default_to_no_parent_error() {
+        let class: Class = serde_json::from_value(json!({
+            "name": "Root", "module_name": "test.dll", "parent_name": null,
+            "fields": [], "metadata": [],
+        }))
+        .unwrap();
+        assert!(class.parent_error.is_none());
+        assert!(
+            serde_json::to_value(&class)
+                .unwrap()
+                .get("parent_error")
+                .is_none()
+        );
+    }
 
     #[test]
     fn writers_preserve_high_bits() {

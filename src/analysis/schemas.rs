@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::memory::validation::{bounded_name, checked_count};
 use crate::source2::*;
 
+use super::AnalysisReport;
+use super::schema_parent::{read_parent_name, resolve_parent};
+
 pub type SchemaMap = BTreeMap<String, (Vec<Class>, Vec<Enum>)>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,6 +31,9 @@ pub struct Class {
     pub name: String,
     pub module_name: String,
     pub parent_name: Option<String>,
+    /// Present only when the class declares a parent but its metadata is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_error: Option<String>,
     pub metadata: Vec<ClassMetadata>,
     pub fields: Vec<ClassField>,
 }
@@ -60,9 +66,12 @@ pub struct TypeScope {
     pub enums: Vec<Enum>,
 }
 
-pub fn schemas<P: Process + MemoryView>(process: &mut P) -> Result<SchemaMap> {
+pub fn schemas<P: Process + MemoryView>(
+    process: &mut P,
+    report: &mut AnalysisReport,
+) -> Result<SchemaMap> {
     let schema_system = read_schema_system(process)?;
-    let type_scopes = read_type_scopes(process, &schema_system)?;
+    let type_scopes = read_type_scopes(process, &schema_system, report)?;
 
     Ok(type_scopes
         .into_iter()
@@ -94,25 +103,53 @@ fn read_class_binding(
         bail!("invalid class name");
     }
 
-    let parent_name = if let Some(ptr) = binding.base_classes.non_null() {
-        let base_class = mem.read_ptr(ptr).data()?;
-        let parent_class = mem.read_ptr(base_class.class).data()?;
-        let name = mem
-            .read_utf8_lossy(parent_class.name.address(), 128)
-            .data_part()?;
-        ensure!(!name.is_empty(), "invalid parent class name");
-        Some(name)
-    } else {
-        None
-    };
+    let parent = resolve_parent(binding.has_base_class, || {
+        ensure!(
+            !binding.base_classes.is_null(),
+            "class declares a parent but base_classes is null"
+        );
+        let base_class = mem.read_ptr(binding.base_classes).data().with_context(|| {
+            format!(
+                "failed to read base-class record at {:?}",
+                binding.base_classes.address()
+            )
+        })?;
+        ensure!(
+            !base_class.class.is_null(),
+            "base-class record contains a null class pointer"
+        );
+        let parent_class = mem.read_ptr(base_class.class).data().with_context(|| {
+            format!(
+                "failed to read parent binding at {:?}",
+                base_class.class.address()
+            )
+        })?;
+        ensure!(
+            !parent_class.name.is_null(),
+            "parent binding contains a null name pointer"
+        );
+        let name_address = parent_class.name.address().to_umem();
+        read_parent_name(|index| {
+            let address = name_address
+                .checked_add(index as umem)
+                .context("parent name address overflow")?;
+            Ok(mem
+                .read::<u8>(address.into())
+                .data()
+                .with_context(|| format!("failed to read parent name byte at {address:#X}"))?)
+        })
+    });
 
-    let fields = read_class_binding_fields(mem, &binding)?;
-    let metadata = read_class_binding_metadata(mem, &binding)?;
+    let fields = read_class_binding_fields(mem, &binding)
+        .with_context(|| format!("failed to read fields for {module_name}:{name}"))?;
+    let metadata = read_class_binding_metadata(mem, &binding)
+        .with_context(|| format!("failed to read metadata for {module_name}:{name}"))?;
 
     Ok(Class {
         name,
         module_name,
-        parent_name,
+        parent_name: parent.name,
+        parent_error: parent.error,
         metadata,
         fields,
     })
@@ -293,56 +330,83 @@ fn read_schema_system<P: Process + MemoryView>(process: &mut P) -> Result<Schema
 fn read_type_scopes(
     mem: &mut impl MemoryView,
     schema_system: &SchemaSystem,
+    report: &mut AnalysisReport,
 ) -> Result<Vec<TypeScope>> {
     let type_scopes = &schema_system.type_scopes;
     let count = checked_count(type_scopes.count)?;
     ensure!(count > 0, "schema system contains no type scopes");
 
-    (0..count).try_fold(Vec::new(), |mut acc, i| {
-        let type_scope_ptr = type_scopes.element(mem, i as _)?;
-        let type_scope = mem.read_ptr(type_scope_ptr).data()?;
-
-        let module_name = bounded_name(&type_scope.name)?;
-
-        let classes: Vec<_> = type_scope
-            .class_bindings
-            .elements(mem)?
-            .iter()
-            .map(|ptr| {
-                read_class_binding(mem, *ptr).with_context(|| {
-                    format!("invalid class in {module_name} at {:?}", ptr.address())
-                })
-            })
-            .collect::<Result<_>>()?;
-
-        let enums: Vec<_> = type_scope
-            .enum_bindings
-            .elements(mem)?
-            .iter()
-            .map(|ptr| {
-                read_enum_binding(mem, *ptr).with_context(|| {
-                    format!("invalid enum in {module_name} at {:?}", ptr.address())
-                })
-            })
-            .collect::<Result<_>>()?;
-
-        if classes.is_empty() && enums.is_empty() {
-            return Ok(acc);
+    let mut scopes = Vec::new();
+    for index in 0..count {
+        let value = (|| {
+            let ptr = type_scopes.element(mem, index)?;
+            read_type_scope(mem, ptr, report)
+        })();
+        if let Some(scope) = report.recover("schemas.scope", &format!("index {index}"), value)? {
+            if !scope.classes.is_empty() || !scope.enums.is_empty() {
+                scopes.push(scope);
+            }
         }
+    }
+    Ok(scopes)
+}
 
-        debug!(
-            "module \"{}\" contains {} class(es) and {} enum(s)",
-            module_name,
-            classes.len(),
-            enums.len(),
-        );
+fn read_type_scope(
+    mem: &mut impl MemoryView,
+    pointer: Pointer64<SchemaSystemTypeScope>,
+    report: &mut AnalysisReport,
+) -> Result<TypeScope> {
+    let scope = mem.read_ptr(pointer).data()?;
+    let module_name = bounded_name(&scope.name)?;
 
-        acc.push(TypeScope {
-            module_name,
-            classes,
-            enums,
-        });
+    let bindings = report
+        .recover(
+            "schemas.class_list",
+            &module_name,
+            scope.class_bindings.elements(mem),
+        )?
+        .unwrap_or_default();
+    let mut classes = Vec::new();
+    for ptr in bindings {
+        let subject = format!("{module_name} at {:?}", ptr.address());
+        if let Some(class) =
+            report.recover("schemas.class", &subject, read_class_binding(mem, ptr))?
+        {
+            if let Some(error) = &class.parent_error {
+                report.note(
+                    "schemas.parent",
+                    &format!("{subject}:{}", class.name),
+                    error.clone(),
+                );
+            }
+            classes.push(class);
+        }
+    }
 
-        Ok(acc)
+    let bindings = report
+        .recover(
+            "schemas.enum_list",
+            &module_name,
+            scope.enum_bindings.elements(mem),
+        )?
+        .unwrap_or_default();
+    let mut enums = Vec::new();
+    for ptr in bindings {
+        let subject = format!("{module_name} at {:?}", ptr.address());
+        if let Some(value) =
+            report.recover("schemas.enum", &subject, read_enum_binding(mem, ptr))?
+        {
+            enums.push(value);
+        }
+    }
+    debug!(
+        "module {module_name:?} contains {} class(es) and {} enum(s)",
+        classes.len(),
+        enums.len()
+    );
+    Ok(TypeScope {
+        module_name,
+        classes,
+        enums,
     })
 }

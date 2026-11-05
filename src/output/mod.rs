@@ -124,6 +124,13 @@ impl<'a> Output<'a> {
             );
         }
 
+        if result.report.allow_partial && out_dir.exists() {
+            ensure!(
+                fs::read_dir(out_dir)?.next().is_none(),
+                "--allow-partial requires a new or empty output directory; choose a fresh --output path to avoid stale files"
+            );
+        }
+
         Ok(Self {
             file_types,
             indent_size,
@@ -133,14 +140,19 @@ impl<'a> Output<'a> {
         })
     }
 
-    pub fn dump_all<P: MemoryView + Process>(&self, process: &mut P) -> Result<()> {
+    pub fn dump_all<P: MemoryView + Process>(&self, process: &mut P) -> Result<usize> {
         let items = [
             ("buttons", Item::Buttons(&self.result.buttons)),
             ("interfaces", Item::Interfaces(&self.result.interfaces)),
             ("offsets", Item::Offsets(&self.result.offsets)),
         ];
 
-        let info = self.render_info(process)?;
+        let mut report = self.result.report.clone();
+        let build_number = report.recover(
+            "info",
+            "engine2.dll:dwBuildNumber",
+            self.read_build_number(process),
+        )?;
         let mut files = BTreeMap::new();
         for (file_name, item) in &items {
             self.render_item(file_name, item, &mut files)?;
@@ -150,11 +162,29 @@ impl<'a> Output<'a> {
             self.render_item(&slugify(module_name), &Item::Schemas(&map), &mut files)?;
         }
         let info_path = self.out_dir.join("info.json");
+        let errors_path = self.out_dir.join("analysis_errors.json");
         ensure!(
-            !files.contains_key(&info_path),
-            "schema output collides with info.json"
+            !files.contains_key(&info_path) && !files.contains_key(&errors_path),
+            "schema output collides with a reserved report filename"
         );
+        files.insert(
+            errors_path,
+            serde_json::to_string_pretty(&report_json(&report))?,
+        );
+        let mut filenames: Vec<_> = files
+            .keys()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        filenames.push("info.json".to_string());
+        let info = self.render_info(build_number, &report, &filenames)?;
 
+        // Recheck before writing, since partial runs must never mix with old data.
+        if report.allow_partial && self.out_dir.exists() {
+            ensure!(
+                fs::read_dir(self.out_dir)?.next().is_none(),
+                "partial output directory is no longer empty"
+            );
+        }
         fs::create_dir_all(self.out_dir)?;
         // Publish the completion marker last. A failed disk write must not leave
         // an old info.json claiming this mixed set is a complete dump.
@@ -172,10 +202,10 @@ impl<'a> Output<'a> {
             let _ = fs::remove_file(&info_path);
             return Err(err).context("failed to publish info.json");
         }
-        Ok(())
+        Ok(report.issues.len())
     }
 
-    fn render_info<P: MemoryView + Process>(&self, process: &mut P) -> Result<String> {
+    fn read_build_number<P: MemoryView + Process>(&self, process: &mut P) -> Result<u32> {
         let offset = self
             .result
             .offsets
@@ -183,13 +213,26 @@ impl<'a> Output<'a> {
             .and_then(|offsets| offsets.get("dwBuildNumber"))
             .ok_or_else(|| anyhow!("missing engine2.dll dwBuildNumber"))?;
         let module = process.module_by_name("engine2.dll")?;
-        let build_number = process
+        process
             .read::<u32>(module.base + *offset)
             .data()
-            .context("failed to read build number")?;
+            .context("failed to read build number")
+    }
+
+    fn render_info(
+        &self,
+        build_number: Option<u32>,
+        report: &AnalysisReport,
+        filenames: &[String],
+    ) -> Result<String> {
         Ok(serde_json::to_string_pretty(&json!({
             "timestamp": self.timestamp.to_rfc3339(),
             "build_number": build_number,
+            "allow_partial": report.allow_partial,
+            "analysis_complete": report.issues.is_empty(),
+            "issue_count": report.issues.len(),
+            "issues_file": "analysis_errors.json",
+            "files": filenames,
         }))?)
     }
 
@@ -224,9 +267,34 @@ impl<'a> Output<'a> {
     fn write_banner(&self, fmt: &mut Formatter<'_>) -> Result<()> {
         writeln!(fmt, "// Generated using https://github.com/a2x/cs2-dumper")?;
         writeln!(fmt, "// {}\n", self.timestamp)?;
+        if self.result.report.allow_partial || !self.result.report.issues.is_empty() {
+            writeln!(
+                fmt,
+                "// Output may be incomplete. Check info.json and analysis_errors.json."
+            )?;
+        }
 
         Ok(())
     }
+}
+
+fn report_json(report: &AnalysisReport) -> serde_json::Value {
+    let issues: Vec<_> = report
+        .issues
+        .iter()
+        .map(|issue| {
+            json!({
+                "stage": issue.stage,
+                "subject": issue.subject,
+                "message": issue.message,
+            })
+        })
+        .collect();
+    json!({
+        "allow_partial": report.allow_partial,
+        "analysis_complete": issues.is_empty(),
+        "issues": issues,
+    })
 }
 
 #[inline]
@@ -326,7 +394,72 @@ mod tests {
             interfaces: BTreeMap::new(),
             offsets: BTreeMap::new(),
             schemas: BTreeMap::new(),
+            report: AnalysisReport::default(),
         }
+    }
+
+    #[test]
+    fn missing_build_number_is_explicitly_null_in_partial_output() {
+        let result = empty_analysis();
+        let formats = ["json".into()];
+        let output = Output::new(&formats, 4, Path::new("output"), &result).unwrap();
+        let mut report = AnalysisReport::new(true);
+        let build = report
+            .recover::<u32>("info", "dwBuildNumber", Err(anyhow!("read failed")))
+            .unwrap();
+        let text = output
+            .render_info(build, &report, &["offsets.json".into()])
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(info["build_number"].is_null());
+        assert_eq!(info["analysis_complete"], false);
+        assert_eq!(info["issue_count"], 1);
+        let errors = report_json(&report);
+        assert_eq!(errors["issues"][0]["subject"], "dwBuildNumber");
+        assert!(
+            errors["issues"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read failed")
+        );
+    }
+
+    #[test]
+    fn optional_omissions_also_mark_output_incomplete() {
+        let result = empty_analysis();
+        let formats = ["json".into()];
+        let output = Output::new(&formats, 4, Path::new("output"), &result).unwrap();
+        let mut report = AnalysisReport::default();
+        report.note("schemas.parent", "Child", "unresolved parent");
+        let text = output.render_info(Some(1234), &report, &[]).unwrap();
+        let info: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(info["analysis_complete"], false);
+        assert_eq!(info["build_number"], 1234);
+        assert_eq!(report_json(&report)["analysis_complete"], false);
+    }
+
+    #[test]
+    fn partial_output_rejects_nonempty_directories_without_deleting_files() {
+        let path = std::env::temp_dir().join(format!(
+            "cs2-dumper-output-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let formats = ["json".into()];
+        let mut result = empty_analysis();
+        result.report.allow_partial = true;
+        assert!(Output::new(&formats, 4, &path, &result).is_ok());
+        fs::write(path.join("old.json"), "old data").unwrap();
+        assert!(Output::new(&formats, 4, &path, &result).is_err());
+        assert_eq!(
+            fs::read_to_string(path.join("old.json")).unwrap(),
+            "old data"
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

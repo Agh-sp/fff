@@ -66,6 +66,10 @@ struct Args {
     /// Prevent creation of the cs2-dumper.log file.
     #[arg(short, long)]
     no_log_file: bool,
+
+    /// Save readable data and report failures. Requires a new or empty output directory.
+    #[arg(long)]
+    allow_partial: bool,
 }
 
 fn main() -> Result<()> {
@@ -134,12 +138,19 @@ fn main() -> Result<()> {
 
     let now = Instant::now();
 
-    let result = analysis::analyze_all(&mut process)?;
+    let result = analysis::analyze_all(&mut process, args.allow_partial)?;
     let output = Output::new(&args.file_types, args.indent_size, &args.output, &result)?;
 
-    output.dump_all(&mut process)?;
+    let issue_count = output.dump_all(&mut process)?;
 
-    info!("analysis completed in {:.2?}", now.elapsed());
+    if issue_count == 0 {
+        info!("analysis completed in {:.2?}", now.elapsed());
+    } else {
+        eprintln!(
+            "Partial output written to {} with {issue_count} issue(s). Read analysis_errors.json before using it; missing entries are NOT zero offsets.",
+            args.output.display()
+        );
+    }
 
     Ok(())
 }
@@ -163,6 +174,16 @@ mod tests {
         assert!(Args::try_parse_from(["cs2-dumper", "-f", "txt"]).is_err());
         assert!(Args::try_parse_from(["cs2-dumper", "-i", "999999999"]).is_err());
         assert!(Args::try_parse_from(["cs2-dumper", "-a", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn partial_output_requires_explicit_opt_in() {
+        assert!(!Args::try_parse_from(["cs2-dumper"]).unwrap().allow_partial);
+        assert!(
+            Args::try_parse_from(["cs2-dumper", "--allow-partial"])
+                .unwrap()
+                .allow_partial
+        );
     }
 
     #[test]

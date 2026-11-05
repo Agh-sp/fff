@@ -12,6 +12,8 @@ use pelite::pe64::{Pe, PeView, Rva};
 
 use phf::{Map, phf_map};
 
+use super::AnalysisReport;
+
 pub type OffsetMap = BTreeMap<String, BTreeMap<String, Rva>>;
 
 macro_rules! pattern_map {
@@ -32,14 +34,16 @@ macro_rules! pattern_map {
                     $($name => ($pattern, $($callback)?)),+
                 };
 
-                pub fn offsets(view: PeView<'_>) -> Result<BTreeMap<String, Rva>> {
+                pub fn offsets(view: PeView<'_>, report: &mut AnalysisReport) -> Result<BTreeMap<String, Rva>> {
                     let mut map = BTreeMap::new();
 
                     for (&name, (pat, callback)) in &PATTERNS {
                         let mut save = vec![0; save_len(pat)];
 
                         if !view.scanner().finds_code(pat, &mut save) {
-                            bail!("outdated pattern: {} in {}.dll", name, stringify!($module));
+                            report.recover::<()>("offsets.pattern", &format!("{}.dll:{name}", stringify!($module)),
+                                Err(anyhow::anyhow!("outdated pattern: {name}")))?;
+                            continue;
                         }
 
                         let rva = save[1];
@@ -47,7 +51,12 @@ macro_rules! pattern_map {
                         map.insert(name.to_string(), rva);
 
                         if let Some(callback) = callback {
-                            callback(&view, &mut map, rva)?;
+                            // Do not publish any partially computed derived values.
+                            let mut derived = BTreeMap::new();
+                            let result = callback(&view, &mut derived, rva).map(|()| derived);
+                            if let Some(derived) = report.recover("offsets.derived", &format!("{}.dll:{name}", stringify!($module)), result)? {
+                                map.extend(derived);
+                            }
                         }
                     }
 
@@ -132,10 +141,16 @@ pattern_map! {
     },
 }
 
-pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
+pub fn offsets<P: Process + MemoryView>(
+    process: &mut P,
+    report: &mut AnalysisReport,
+) -> Result<OffsetMap> {
     let mut map = BTreeMap::new();
 
-    let modules: [(&str, fn(PeView) -> Result<BTreeMap<String, u32>>); 5] = [
+    let modules: [(
+        &str,
+        fn(PeView, &mut AnalysisReport) -> Result<BTreeMap<String, u32>>,
+    ); 5] = [
         ("client.dll", client::offsets),
         ("engine2.dll", engine2::offsets),
         ("inputsystem.dll", input_system::offsets),
@@ -144,18 +159,17 @@ pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
     ];
 
     for (module_name, offsets) in &modules {
-        let module = process.module_by_name(module_name)?;
-
-        let buf = process
-            .read_raw(module.base, module.size as _)
-            .data_part()?;
-
-        let view = PeView::from_bytes(&buf)?;
-
-        map.insert(
-            module_name.to_string(),
-            offsets(view).with_context(|| format!("failed to scan {module_name}"))?,
-        );
+        let result = (|| {
+            let module = process.module_by_name(module_name)?;
+            let buf = process
+                .read_raw(module.base, module.size as _)
+                .data_part()?;
+            let view = PeView::from_bytes(&buf)?;
+            offsets(view, report).with_context(|| format!("failed to scan {module_name}"))
+        })();
+        if let Some(values) = report.recover("offsets.module", module_name, result)? {
+            map.insert(module_name.to_string(), values);
+        }
     }
 
     Ok(map)

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 
-use log::{debug, warn};
+use log::debug;
 
 use memflow::prelude::v1::*;
 
@@ -13,18 +13,34 @@ use crate::memory::address;
 use crate::memory::validation::TraversalGuard;
 use crate::source2::InterfaceReg;
 
+use super::AnalysisReport;
 use super::interface_factory::{FactoryResult, resolve_factory};
 use super::interface_policy::module_result;
 
 pub type InterfaceMap = BTreeMap<String, BTreeMap<String, umem>>;
 
-pub fn interfaces<P: Process + MemoryView>(process: &mut P) -> Result<InterfaceMap> {
+pub fn interfaces<P: Process + MemoryView>(
+    process: &mut P,
+    report: &mut AnalysisReport,
+) -> Result<InterfaceMap> {
     let mut result = InterfaceMap::new();
     for module in process.module_list()? {
         // Keep the entire module read inside the error boundary: unsupported
         // exports may fail while resolving the list, not just while walking it.
         let module_name = module.name.to_string();
-        let interfaces = module_result(&module_name, read_module_interfaces(process, &module))?;
+        let value = read_module_interfaces(process, &module, report);
+        let error = value.as_ref().err().map(|error| format!("{error:#}"));
+        let value = module_result(&module_name, value);
+        if matches!(&value, Ok(None)) {
+            report.note(
+                "interfaces.optional_module",
+                &module_name,
+                error.unwrap_or_default(),
+            );
+        }
+        let interfaces = report
+            .recover("interfaces.module", &module_name, value)?
+            .flatten();
         if let Some(interfaces) = interfaces.filter(|interfaces| !interfaces.is_empty()) {
             result.insert(module_name, interfaces);
         }
@@ -36,6 +52,7 @@ pub fn interfaces<P: Process + MemoryView>(process: &mut P) -> Result<InterfaceM
 fn read_module_interfaces(
     mem: &mut impl MemoryView,
     module: &ModuleInfo,
+    report: &mut AnalysisReport,
 ) -> Result<BTreeMap<String, umem>> {
     let buf = mem
         .read_raw(module.base, module.size as _)
@@ -59,13 +76,14 @@ fn read_module_interfaces(
         .read_addr64(list_ptr)
         .data()
         .with_context(|| format!("failed to read interface list head at {list_ptr:?}"))?;
-    read_interfaces(mem, module, list_head)
+    read_interfaces(mem, module, list_head, report)
 }
 
 fn read_interfaces(
     mem: &mut impl MemoryView,
     module: &ModuleInfo,
     list_head: Address,
+    report: &mut AnalysisReport,
 ) -> Result<BTreeMap<String, umem>> {
     let mut result = BTreeMap::new();
 
@@ -119,9 +137,10 @@ fn read_interfaces(
             FactoryResult::Omitted(reason) => {
                 // Keep valid entries and continue via the registration's next
                 // pointer, not through arbitrary factory machine code.
-                warn!(
-                    "omitting interface {name:?} in {} (factory {factory:?}): {reason}",
-                    module.name
+                report.note(
+                    "interfaces.factory",
+                    &format!("{}:{name}", module.name),
+                    format!("omitted factory {factory:?}: {reason}"),
                 );
             }
         }
