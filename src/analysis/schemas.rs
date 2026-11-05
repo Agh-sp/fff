@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use std::ffi::CStr;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use log::debug;
 
@@ -12,6 +11,7 @@ use pelite::pe64::{Pe, PeView};
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory::validation::{bounded_name, checked_count};
 use crate::source2::*;
 
 pub type SchemaMap = BTreeMap<String, (Vec<Class>, Vec<Enum>)>;
@@ -79,7 +79,7 @@ fn read_class_binding(
     mem: &mut impl MemoryView,
     binding_ptr: Pointer64<SchemaClassBinding>,
 ) -> Result<Class> {
-    let binding = mem.read_ptr(binding_ptr).data_part()?;
+    let binding = mem.read_ptr(binding_ptr).data()?;
 
     let module_name = mem
         .read_utf8_lossy(binding.module_name.address(), 128)
@@ -94,17 +94,17 @@ fn read_class_binding(
         bail!("invalid class name");
     }
 
-    let parent_name = binding.base_classes.non_null().and_then(|ptr| {
-        let base_class = mem.read_ptr(ptr).data_part().ok()?;
-        let parent_class = mem.read_ptr(base_class.class).data_part().ok()?;
-
-        let parent_name = mem
+    let parent_name = if let Some(ptr) = binding.base_classes.non_null() {
+        let base_class = mem.read_ptr(ptr).data()?;
+        let parent_class = mem.read_ptr(base_class.class).data()?;
+        let name = mem
             .read_utf8_lossy(parent_class.name.address(), 128)
-            .data_part()
-            .ok()?;
-
-        (!parent_name.is_empty()).then_some(parent_name)
-    });
+            .data_part()?;
+        ensure!(!name.is_empty(), "invalid parent class name");
+        Some(name)
+    } else {
+        None
+    };
 
     let fields = read_class_binding_fields(mem, &binding)?;
     let metadata = read_class_binding_metadata(mem, &binding)?;
@@ -122,19 +122,20 @@ fn read_class_binding_fields(
     mem: &mut impl MemoryView,
     binding: &SchemaClassBinding,
 ) -> Result<Vec<ClassField>> {
-    if binding.fields.is_null() {
-        return Ok(Vec::new());
-    }
+    let count = checked_count(i32::from(binding.field_count))?;
+    ensure!(
+        count == 0 || !binding.fields.is_null(),
+        "null class fields with nonzero count"
+    );
 
-    (0..binding.field_count).try_fold(Vec::new(), |mut acc, i| {
-        let field = mem.read_ptr(binding.fields.at(i as _)).data_part()?;
+    (0..count).try_fold(Vec::new(), |mut acc, i| {
+        let field = mem.read_ptr(binding.fields.at(i as _)).data()?;
 
-        if field.r#type.is_null() {
-            return Ok(acc);
-        }
+        ensure!(!field.r#type.is_null(), "null field type");
+        ensure!(field.offset >= 0, "negative class field offset");
 
         let name = mem.read_utf8_lossy(field.name.address(), 128).data_part()?;
-        let r#type = mem.read_ptr(field.r#type).data_part()?;
+        let r#type = mem.read_ptr(field.r#type).data()?;
 
         let type_name = mem
             .read_utf8_lossy(r#type.name.address(), 128)
@@ -155,27 +156,26 @@ fn read_class_binding_metadata(
     mem: &mut impl MemoryView,
     binding: &SchemaClassBinding,
 ) -> Result<Vec<ClassMetadata>> {
-    if binding.static_metadata.is_null() {
-        return Ok(Vec::new());
-    }
+    let count = checked_count(i32::from(binding.static_metadata_count))?;
+    ensure!(
+        count == 0 || !binding.static_metadata.is_null(),
+        "null metadata with nonzero count"
+    );
 
-    (0..binding.static_metadata_count).try_fold(Vec::new(), |mut acc, i| {
-        let metadata = mem
-            .read_ptr(binding.static_metadata.at(i as _))
-            .data_part()?;
-
-        if metadata.network_value.is_null() {
-            return Ok(acc);
-        }
+    (0..count).try_fold(Vec::new(), |mut acc, i| {
+        let metadata = mem.read_ptr(binding.static_metadata.at(i as _)).data()?;
 
         let name = mem
             .read_utf8_lossy(metadata.name.address(), 128)
             .data_part()?;
 
-        let network_value = mem.read_ptr(metadata.network_value).data_part()?;
-
         let metadata = match name.as_str() {
             "MNetworkChangeCallback" => unsafe {
+                ensure!(
+                    !metadata.network_value.is_null(),
+                    "null network callback metadata"
+                );
+                let network_value = mem.read_ptr(metadata.network_value).data()?;
                 let name = mem
                     .read_utf8_lossy(network_value.value.name_ptr.address(), 128)
                     .data_part()?;
@@ -183,6 +183,11 @@ fn read_class_binding_metadata(
                 ClassMetadata::NetworkChangeCallback { name }
             },
             "MNetworkVarNames" => unsafe {
+                ensure!(
+                    !metadata.network_value.is_null(),
+                    "null network variable metadata"
+                );
+                let network_value = mem.read_ptr(metadata.network_value).data()?;
                 let var_value = network_value.value.var_value;
 
                 let name = mem
@@ -209,7 +214,7 @@ fn read_enum_binding(
     mem: &mut impl MemoryView,
     binding_ptr: Pointer64<SchemaEnumBinding>,
 ) -> Result<Enum> {
-    let binding = mem.read_ptr(binding_ptr).data_part()?;
+    let binding = mem.read_ptr(binding_ptr).data()?;
 
     let name = mem
         .read_utf8_lossy(binding.name.address(), 128)
@@ -219,6 +224,10 @@ fn read_enum_binding(
         bail!("invalid enum name");
     }
 
+    ensure!(
+        matches!(binding.alignment, 1 | 2 | 4 | 8),
+        "invalid enum alignment"
+    );
     let members = read_enum_binding_members(mem, &binding)?;
 
     Ok(Enum {
@@ -233,12 +242,13 @@ fn read_enum_binding_members(
     mem: &mut impl MemoryView,
     binding: &SchemaEnumBinding,
 ) -> Result<Vec<EnumMember>> {
-    if binding.enumerators.is_null() {
-        return Ok(Vec::new());
-    }
+    ensure!(
+        binding.enumerator_count == 0 || !binding.enumerators.is_null(),
+        "null enum members with nonzero count"
+    );
 
     (0..binding.enumerator_count).try_fold(Vec::new(), |mut acc, i| {
-        let r#enum = mem.read_ptr(binding.enumerators.at(i as _)).data_part()?;
+        let r#enum = mem.read_ptr(binding.enumerators.at(i as _)).data()?;
 
         let name = mem
             .read_utf8_lossy(r#enum.name.address(), 128)
@@ -271,9 +281,9 @@ fn read_schema_system<P: Process + MemoryView>(process: &mut P) -> Result<Schema
         bail!("outdated schema system pattern");
     }
 
-    let schema_system: SchemaSystem = process.read(module.base + save[1]).data_part()?;
+    let schema_system: SchemaSystem = process.read(module.base + save[1]).data()?;
 
-    if schema_system.registration_count == 0 {
+    if schema_system.registration_count <= 0 {
         bail!("no schema registrations");
     }
 
@@ -285,28 +295,36 @@ fn read_type_scopes(
     schema_system: &SchemaSystem,
 ) -> Result<Vec<TypeScope>> {
     let type_scopes = &schema_system.type_scopes;
+    let count = checked_count(type_scopes.count)?;
+    ensure!(count > 0, "schema system contains no type scopes");
 
-    (0..type_scopes.count).try_fold(Vec::new(), |mut acc, i| {
+    (0..count).try_fold(Vec::new(), |mut acc, i| {
         let type_scope_ptr = type_scopes.element(mem, i as _)?;
-        let type_scope = mem.read_ptr(type_scope_ptr).data_part()?;
+        let type_scope = mem.read_ptr(type_scope_ptr).data()?;
 
-        let module_name = unsafe { CStr::from_ptr(type_scope.name.as_ptr()) }
-            .to_string_lossy()
-            .to_string();
+        let module_name = bounded_name(&type_scope.name)?;
 
         let classes: Vec<_> = type_scope
             .class_bindings
-            .elements(mem)
+            .elements(mem)?
             .iter()
-            .filter_map(|ptr| read_class_binding(mem, *ptr).ok())
-            .collect();
+            .map(|ptr| {
+                read_class_binding(mem, *ptr).with_context(|| {
+                    format!("invalid class in {module_name} at {:?}", ptr.address())
+                })
+            })
+            .collect::<Result<_>>()?;
 
         let enums: Vec<_> = type_scope
             .enum_bindings
-            .elements(mem)
+            .elements(mem)?
             .iter()
-            .filter_map(|ptr| read_enum_binding(mem, *ptr).ok())
-            .collect();
+            .map(|ptr| {
+                read_enum_binding(mem, *ptr).with_context(|| {
+                    format!("invalid enum in {module_name} at {:?}", ptr.address())
+                })
+            })
+            .collect::<Result<_>>()?;
 
         if classes.is_empty() && enums.is_empty() {
             return Ok(acc);

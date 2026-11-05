@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use chrono::{DateTime, Utc};
 
@@ -15,6 +16,7 @@ use formatter::Formatter;
 use crate::analysis::*;
 
 mod buttons;
+mod enum_value;
 mod formatter;
 mod interfaces;
 mod offsets;
@@ -35,7 +37,7 @@ impl<'a> Item<'a> {
             "json" => self.write_json(fmt),
             "rs" => self.write_rs(fmt),
             "zig" => self.write_zig(fmt),
-            _ => unimplemented!(),
+            _ => Err(fmt::Error),
         }
     }
 }
@@ -110,7 +112,17 @@ impl<'a> Output<'a> {
         out_dir: &'a Path,
         result: &'a AnalysisResult,
     ) -> Result<Self> {
-        fs::create_dir_all(&out_dir)?;
+        ensure!(
+            !file_types.is_empty(),
+            "at least one output format is required"
+        );
+        ensure!(indent_size <= 16, "indent size must be between 0 and 16");
+        for file_type in file_types {
+            ensure!(
+                matches!(file_type.as_str(), "cs" | "hpp" | "json" | "rs" | "zig"),
+                "unsupported output format: {file_type}"
+            );
+        }
 
         Ok(Self {
             file_types,
@@ -128,67 +140,84 @@ impl<'a> Output<'a> {
             ("offsets", Item::Offsets(&self.result.offsets)),
         ];
 
+        let info = self.render_info(process)?;
+        let mut files = BTreeMap::new();
         for (file_name, item) in &items {
-            self.dump_item(file_name, item)?;
+            self.render_item(file_name, item, &mut files)?;
         }
+        for (module_name, (classes, enums)) in &self.result.schemas {
+            let map = SchemaMap::from([(module_name.clone(), (classes.clone(), enums.clone()))]);
+            self.render_item(&slugify(module_name), &Item::Schemas(&map), &mut files)?;
+        }
+        let info_path = self.out_dir.join("info.json");
+        ensure!(
+            !files.contains_key(&info_path),
+            "schema output collides with info.json"
+        );
 
-        self.dump_schemas()?;
-        self.dump_info(process)?;
-
+        fs::create_dir_all(self.out_dir)?;
+        // Publish the completion marker last. A failed disk write must not leave
+        // an old info.json claiming this mixed set is a complete dump.
+        match fs::remove_file(&info_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        for (path, content) in files {
+            fs::write(&path, content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+        if let Err(err) = fs::write(&info_path, info) {
+            // Best effort: do not leave a partially written completion marker.
+            let _ = fs::remove_file(&info_path);
+            return Err(err).context("failed to publish info.json");
+        }
         Ok(())
     }
 
-    fn dump_info<P: MemoryView + Process>(&self, process: &mut P) -> Result<()> {
-        let file_path = self.out_dir.join("info.json");
-
-        let build_number = self
+    fn render_info<P: MemoryView + Process>(&self, process: &mut P) -> Result<String> {
+        let offset = self
             .result
             .offsets
-            .iter()
-            .find_map(|(module_name, offsets)| {
-                let module = process.module_by_name(module_name).ok()?;
-                let offset = offsets.iter().find(|(name, _)| *name == "dwBuildNumber")?.1;
-
-                process.read::<u32>(module.base + offset).data_part().ok()
-            })
-            .ok_or(anyhow!("failed to read build number"))?;
-
-        let content = serde_json::to_string_pretty(&json!({
+            .get("engine2.dll")
+            .and_then(|offsets| offsets.get("dwBuildNumber"))
+            .ok_or_else(|| anyhow!("missing engine2.dll dwBuildNumber"))?;
+        let module = process.module_by_name("engine2.dll")?;
+        let build_number = process
+            .read::<u32>(module.base + *offset)
+            .data()
+            .context("failed to read build number")?;
+        Ok(serde_json::to_string_pretty(&json!({
             "timestamp": self.timestamp.to_rfc3339(),
             "build_number": build_number,
-        }))?;
-
-        fs::write(&file_path, &content)?;
-
-        Ok(())
+        }))?)
     }
 
-    fn dump_item(&self, file_name: &str, item: &Item) -> Result<()> {
+    fn render_item(
+        &self,
+        file_name: &str,
+        item: &Item,
+        files: &mut BTreeMap<PathBuf, String>,
+    ) -> Result<()> {
+        let mut seen_formats = std::collections::HashSet::new();
         for file_type in self.file_types {
+            if !seen_formats.insert(file_type) {
+                continue;
+            }
             let mut out = String::new();
             let mut fmt = Formatter::new(&mut out, self.indent_size);
-
             if file_type != "json" {
                 self.write_banner(&mut fmt)?;
             }
-
             item.write(&mut fmt, file_type)?;
-
-            let file_path = self.out_dir.join(format!("{}.{}", file_name, file_type));
-
-            fs::write(&file_path, out)?;
+            let path = self.out_dir.join(format!("{file_name}.{file_type}"));
+            ensure!(
+                !files.contains_key(&path),
+                "output filename collision: {}",
+                path.display()
+            );
+            files.insert(path, out);
         }
-
-        Ok(())
-    }
-
-    fn dump_schemas(&self) -> Result<()> {
-        for (module_name, (classes, enums)) in &self.result.schemas {
-            let map = SchemaMap::from([(module_name.clone(), (classes.clone(), enums.clone()))]);
-
-            self.dump_item(&slugify(&module_name), &Item::Schemas(&map))?;
-        }
-
         Ok(())
     }
 
@@ -285,4 +314,53 @@ fn is_zig_keyword(input: &str) -> bool {
             | "volatile"
             | "while"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_analysis() -> AnalysisResult {
+        AnalysisResult {
+            buttons: BTreeMap::new(),
+            interfaces: BTreeMap::new(),
+            offsets: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn validates_output_options() {
+        let result = empty_analysis();
+        let path = Path::new("unused-test-output");
+        assert!(Output::new(&["txt".into()], 4, path, &result).is_err());
+        assert!(Output::new(&["../bad".into()], 4, path, &result).is_err());
+        assert!(Output::new(&[], 4, path, &result).is_err());
+        assert!(Output::new(&["json".into()], usize::MAX, path, &result).is_err());
+    }
+
+    #[test]
+    fn rendering_detects_collisions_and_deduplicates_formats() {
+        let result = empty_analysis();
+        let formats = ["json".into(), "json".into()];
+        let output = Output::new(&formats, 4, Path::new("output"), &result).unwrap();
+        let mut files = BTreeMap::new();
+        let item = Item::Buttons(&result.buttons);
+        output.render_item("buttons", &item, &mut files).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(serde_json::from_str::<serde_json::Value>(files.values().next().unwrap()).is_ok());
+        assert!(output.render_item("buttons", &item, &mut files).is_err());
+    }
+
+    #[test]
+    fn unknown_format_returns_error_instead_of_panicking() {
+        let result = empty_analysis();
+        let mut text = String::new();
+        let mut fmt = Formatter::new(&mut text, 4);
+        assert!(
+            Item::Buttons(&result.buttons)
+                .write(&mut fmt, "txt")
+                .is_err()
+        );
+    }
 }

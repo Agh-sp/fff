@@ -35,11 +35,9 @@ impl<'a> Formatter<'a> {
     {
         self.indent_level += 1;
 
-        f(self)?;
-
+        let result = f(self);
         self.indent_level -= 1;
-
-        Ok(())
+        result
     }
 
     #[inline]
@@ -69,5 +67,27 @@ impl<'a> Write for Formatter<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restores_indent_after_error() {
+        let mut text = String::new();
+        let mut fmt = Formatter::new(&mut text, 4);
+        assert!(fmt.indent(|_| Err(fmt::Error)).is_err());
+        assert_eq!(fmt.indent_level, 0);
+    }
+
+    #[test]
+    fn formats_nested_blocks() {
+        let mut text = String::new();
+        let mut fmt = Formatter::new(&mut text, 2);
+        fmt.block("outer", false, |fmt| writeln!(fmt, "value"))
+            .unwrap();
+        assert_eq!(text, "outer {\n  value\n}\n");
     }
 }
