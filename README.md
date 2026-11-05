@@ -73,6 +73,12 @@ Invalid arguments are rejected before analysis. Incomplete fixed-size reads, det
 
 This exception is limited to `vstdlib_s64.dll` (case-insensitive). Errors in other modules, including `client.dll`, `engine2.dll`, and `schemasystem.dll`, remain fatal. Finding no interfaces at all also remains an error. Check the log for warnings before treating an interface inventory as complete. This change does not add support for a different Steam interface layout or update game offset signatures.
 
+### Interface factory decoding
+
+Interface output contains **instance RVAs relative to the registering module**, not arbitrary instruction operands or absolute heap addresses. The dumper recognizes small x64 `lea rax, [rip+disp32]; ret` and `mov rax, [rip+disp32]; ret` factories, null-return stubs, and bounded direct/indirect jump thunks (including NOP/ENDBR64 prefixes). A `mov` factory is dereferenced; its pointer slot is not mislabeled as the instance.
+
+Null-returning factories, unsupported factory implementations, and instances outside the registering module are omitted **individually**, with a warning naming the interface, module, and factory address. Other entries in that module are still processed. This avoids treating arbitrary code bytes as a displacement and failing the whole dump with `interfaces address outside module`. It does not guarantee a complete interface inventory: check the warnings for omitted entries. Memory read failures, truncated recognized instructions, cycles, and traversal-limit failures still propagate as errors (subject to the optional Steam-module exception above). Game offset and schema failures are not suppressed.
+
 If you see `outdated pattern`, the executable signatures or memory layouts may need updating for that particular CS2 build. Run with `-vvv` and keep the full error message and game build number; do not reuse old offsets as if they were freshly extracted.
 
 ## License
