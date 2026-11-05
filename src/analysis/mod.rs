@@ -10,6 +10,7 @@ use log::info;
 use memflow::prelude::v1::*;
 
 mod buttons;
+mod interface_policy;
 mod interfaces;
 mod offsets;
 mod schemas;

@@ -67,6 +67,12 @@ These live tests may require being connected to a map and sufficient permissions
 
 Invalid arguments are rejected before analysis. Incomplete fixed-size reads, detected list cycles, invalid counts, and missing offset patterns return errors rather than silently publishing an incomplete successful dump. All files are rendered and the build number is read before existing output is changed. `info.json` is written last as the completion marker; a missing or invalid marker means publication did not complete. Publishing the entire directory is not transactional, so avoid reading it while a dump is running. Files for modules removed in a newer game build are not automatically deleted; use a fresh output directory when changing builds.
 
+### Optional Steam interface module
+
+`vstdlib_s64.dll` is a Steam support module, not a required Source 2 game module. Its interface implementation may differ from the layout this dumper understands. If reading its image, resolving its `CreateInterface` export, or walking its interface list fails, the dumper logs a warning with the module name and full error chain and continues. All interfaces from that failed module are omitted; partial entries are not published. Successful reads are still retained.
+
+This exception is limited to `vstdlib_s64.dll` (case-insensitive). Errors in other modules, including `client.dll`, `engine2.dll`, and `schemasystem.dll`, remain fatal. Finding no interfaces at all also remains an error. Check the log for warnings before treating an interface inventory as complete. This change does not add support for a different Steam interface layout or update game offset signatures.
+
 If you see `outdated pattern`, the executable signatures or memory layouts may need updating for that particular CS2 build. Run with `-vvv` and keep the full error message and game build number; do not reuse old offsets as if they were freshly extracted.
 
 ## License
