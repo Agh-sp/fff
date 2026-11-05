@@ -7,6 +7,7 @@ use serde_json::json;
 
 use super::{CodeWriter, Formatter, SchemaMap, slugify, zig_ident};
 
+use super::enum_value::{format_enum_member_value, unsigned_enum_value};
 use crate::analysis::ClassMetadata;
 
 impl CodeWriter for SchemaMap {
@@ -41,15 +42,10 @@ impl CodeWriter for SchemaMap {
                                         .members
                                         .iter()
                                         .map(|member| {
-                                            let formatted_value =
-                                                if (0..=i32::MAX as i64).contains(&member.value) {
-                                                    format!("{:#X}", member.value)
-                                                } else {
-                                                    format!(
-                                                        "unchecked(({}){})",
-                                                        type_name, member.value
-                                                    )
-                                                };
+                                            let formatted_value = format_enum_member_value(
+                                                member.value,
+                                                enum_.alignment,
+                                            );
 
                                             format!("{} = {}", member.name, formatted_value)
                                         })
@@ -135,21 +131,10 @@ impl CodeWriter for SchemaMap {
                                             .members
                                             .iter()
                                             .map(|member| {
-                                                let formatted_value = if (0..=i32::MAX as i64)
-                                                    .contains(&member.value)
-                                                {
-                                                    format!("{:#X}", member.value)
-                                                } else {
-                                                    let max_value = match type_name {
-                                                        "uint8_t" => 0xFFu64,
-                                                        "uint16_t" => 0xFFFFu64,
-                                                        "uint32_t" => 0xFFFFFFFFu64,
-                                                        "uint64_t" => 0xFFFFFFFFFFFFFFFFu64,
-                                                        _ => 0,
-                                                    };
-
-                                                    format!("{:#X}", max_value)
-                                                };
+                                                let formatted_value = format_enum_member_value(
+                                                    member.value,
+                                                    enum_.alignment,
+                                                );
 
                                                 format!("{} = {}", member.name, formatted_value)
                                             })
@@ -329,15 +314,17 @@ impl CodeWriter for SchemaMap {
                                             .iter()
                                             .filter_map(|member| {
                                                 // Skip duplicate values.
-                                                if !used_values.insert(member.value) {
+                                                if !used_values.insert(unsigned_enum_value(
+                                                    member.value,
+                                                    enum_.alignment,
+                                                )) {
                                                     return None;
                                                 }
 
-                                                let formatted_value = if member.value == -1 {
-                                                    format!("{}::MAX", type_name)
-                                                } else {
-                                                    format!("{:#X}", member.value)
-                                                };
+                                                let formatted_value = format_enum_member_value(
+                                                    member.value,
+                                                    enum_.alignment,
+                                                );
 
                                                 Some(format!(
                                                     "{} = {}",
@@ -430,13 +417,16 @@ impl CodeWriter for SchemaMap {
                                             .iter()
                                             .filter_map(|member| {
                                                 // Skip duplicate values.
-                                                if !used_values.insert(member.value) {
+                                                if !used_values.insert(unsigned_enum_value(
+                                                    member.value,
+                                                    enum_.alignment,
+                                                )) {
                                                     return None;
                                                 }
 
-                                                let formatted_value = format_zig_enum_member_value(
+                                                let formatted_value = format_enum_member_value(
                                                     member.value,
-                                                    type_name,
+                                                    enum_.alignment,
                                                 );
 
                                                 Some(format!(
@@ -522,18 +512,69 @@ fn write_metadata(fmt: &mut Formatter<'_>, metadata: &[ClassMetadata]) -> fmt::R
     Ok(())
 }
 
-fn format_zig_enum_member_value(value: i64, type_name: &str) -> String {
-    if value >= 0 {
-        return format!("{:#X}", value);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{Enum, EnumMember};
+
+    #[test]
+    fn writers_preserve_high_bits() {
+        let schemas = SchemaMap::from([(
+            "test.dll".into(),
+            (
+                vec![],
+                vec![Enum {
+                    name: "Flags".into(),
+                    alignment: 4,
+                    size: 1,
+                    members: vec![EnumMember {
+                        name: "HighBit".into(),
+                        value: 0x80000000,
+                    }],
+                }],
+            ),
+        )]);
+        for extension in ["cs", "hpp", "rs", "zig"] {
+            let mut text = String::new();
+            let mut fmt = Formatter::new(&mut text, 4);
+            super::super::Item::Schemas(&schemas)
+                .write(&mut fmt, extension)
+                .unwrap();
+            assert!(text.contains("HighBit = 0x80000000"), "{extension}: {text}");
+        }
     }
 
-    let wrapped_value = match type_name {
-        "u8" => value as u8 as u64,
-        "u16" => value as u16 as u64,
-        "u32" => value as u32 as u64,
-        "u64" => value as u64,
-        _ => 0,
-    };
-
-    format!("{:#X}", wrapped_value)
+    #[test]
+    fn rust_and_zig_deduplicate_wrapped_values() {
+        let schemas = SchemaMap::from([(
+            "test.dll".into(),
+            (
+                vec![],
+                vec![Enum {
+                    name: "Aliases".into(),
+                    alignment: 1,
+                    size: 2,
+                    members: vec![
+                        EnumMember {
+                            name: "First".into(),
+                            value: -1,
+                        },
+                        EnumMember {
+                            name: "Alias".into(),
+                            value: 255,
+                        },
+                    ],
+                }],
+            ),
+        )]);
+        for extension in ["rs", "zig"] {
+            let mut text = String::new();
+            let mut fmt = Formatter::new(&mut text, 4);
+            super::super::Item::Schemas(&schemas)
+                .write(&mut fmt, extension)
+                .unwrap();
+            assert!(text.contains("First = 0xFF"));
+            assert!(!text.contains("Alias ="));
+        }
+    }
 }

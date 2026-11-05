@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
-use log::{debug, error};
+use log::debug;
 
 use memflow::prelude::v1::*;
 
@@ -26,22 +26,20 @@ macro_rules! pattern_map {
                     &'static str,
                     (
                         &'static [Atom],
-                        Option<fn(&PeView, &mut BTreeMap<String, Rva>, Rva)>,
+                        Option<fn(&PeView, &mut BTreeMap<String, Rva>, Rva) -> Result<()>>,
                     ),
                 > = phf_map! {
                     $($name => ($pattern, $($callback)?)),+
                 };
 
-                pub fn offsets(view: PeView<'_>) -> BTreeMap<String, Rva> {
+                pub fn offsets(view: PeView<'_>) -> Result<BTreeMap<String, Rva>> {
                     let mut map = BTreeMap::new();
 
                     for (&name, (pat, callback)) in &PATTERNS {
                         let mut save = vec![0; save_len(pat)];
 
                         if !view.scanner().finds_code(pat, &mut save) {
-                            error!("outdated pattern: {}", name);
-
-                            continue;
+                            bail!("outdated pattern: {} in {}.dll", name, stringify!($module));
                         }
 
                         let rva = save[1];
@@ -49,7 +47,7 @@ macro_rules! pattern_map {
                         map.insert(name.to_string(), rva);
 
                         if let Some(callback) = callback {
-                            callback(&view, &mut map, rva);
+                            callback(&view, &mut map, rva)?;
                         }
                     }
 
@@ -63,7 +61,7 @@ macro_rules! pattern_map {
                         );
                     }
 
-                    map
+                    Ok(map)
                 }
             }
         )+
@@ -76,7 +74,10 @@ pattern_map! {
             let mut save = [0; 2];
 
             if view.scanner().finds_code(pattern!("f2420f108428u4"), &mut save) {
-                map.insert("dwViewAngles".to_string(), rva + save[1]);
+                map.insert("dwViewAngles".to_string(), rva.checked_add(save[1]).context("dwViewAngles overflow")?);
+                Ok(())
+            } else {
+                bail!("outdated pattern: dwViewAngles");
             }
         }),
         "dwEntityList" => pattern!("48890d${'} e9${} cc") => None,
@@ -91,11 +92,15 @@ pattern_map! {
             let mut save = [0; 2];
 
             if view.scanner().finds_code(pattern!("4c39b6u4 74? 4488be"), &mut save) {
-                map.insert("dwLocalPlayerPawn".to_string(), rva + save[1]);
+                map.insert("dwLocalPlayerPawn".to_string(), rva.checked_add(save[1]).context("dwLocalPlayerPawn overflow")?);
+                Ok(())
+            } else {
+                bail!("outdated pattern: dwLocalPlayerPawn");
             }
         }),
         "dwSensitivity" => pattern!("488d0d${[8]'} 0f57c90f28f0") => Some(|_view, map, _rva| {
             map.insert("dwSensitivity_sensitivity".to_string(), 0x58);
+            Ok(())
         }),
         "dwServerConfirmedReservation" => pattern!("488905${'} e8${} 4885db") => None,
         "dwViewMatrix" => pattern!("488d0d${'} 48c1e006") => None,
@@ -130,7 +135,7 @@ pattern_map! {
 pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
     let mut map = BTreeMap::new();
 
-    let modules: [(&str, fn(PeView) -> BTreeMap<String, u32>); 5] = [
+    let modules: [(&str, fn(PeView) -> Result<BTreeMap<String, u32>>); 5] = [
         ("client.dll", client::offsets),
         ("engine2.dll", engine2::offsets),
         ("inputsystem.dll", input_system::offsets),
@@ -147,13 +152,16 @@ pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
 
         let view = PeView::from_bytes(&buf)?;
 
-        map.insert(module_name.to_string(), offsets(view));
+        map.insert(
+            module_name.to_string(),
+            offsets(view).with_context(|| format!("failed to scan {module_name}"))?,
+        );
     }
 
     Ok(map)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use std::fs;
     use std::sync::Once;
@@ -165,6 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires running Windows CS2 and freshly generated output"]
     fn build_number() -> Result<()> {
         let mut process = setup()?;
 
@@ -180,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires running Windows CS2 and freshly generated output"]
     fn global_vars() -> Result<()> {
         let mut process = setup()?;
 
@@ -189,9 +199,7 @@ mod tests {
 
         let global_vars: u64 = process.read(client_base + offset).data_part()?;
 
-        let map_name_addr = process
-            .read_addr64((global_vars + 0x180).into())
-            .data_part()?;
+        let map_name_addr = process.read_addr64((global_vars + 0x180).into()).data()?;
 
         let map_name = process.read_utf8(map_name_addr, 128).data_part()?;
 
@@ -201,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires running Windows CS2 and freshly generated output"]
     fn local_controller() -> Result<()> {
         let mut process = setup()?;
 
@@ -225,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires running Windows CS2 and freshly generated output"]
     fn local_pawn() -> Result<()> {
         #[derive(Pod)]
         #[repr(C)]
@@ -267,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires running Windows CS2 and freshly generated output"]
     fn window_size() -> Result<()> {
         let mut process = setup()?;
 

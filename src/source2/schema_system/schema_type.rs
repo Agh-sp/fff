@@ -77,13 +77,16 @@ pub struct SchemaType {
     pad_0: [u8; 0x8],                                 // 0x0000
     pub name: Pointer64<ReprCString>,                 // 0x0008
     pub type_scope: Pointer64<SchemaSystemTypeScope>, // 0x0010
-    pub type_category: SchemaTypeCategory,            // 0x0018
-    pub atomic_category: SchemaAtomicCategory,        // 0x0019
+    pub type_category: u8,                            // 0x0018 (raw SchemaTypeCategory)
+    pub atomic_category: u8,                          // 0x0019 (raw SchemaAtomicCategory)
     pub value: SchemaTypeUnion,                       // 0x0020
 }
 
+// SAFETY: Remote discriminants are raw integers, not Rust enums. Every field
+// accepts arbitrary bytes; repr(C) fixes the layout of the struct and union.
 unsafe impl Pod for SchemaType {}
 
+#[repr(C)]
 pub union SchemaTypeUnion {
     pub r#type: Pointer64<SchemaType>,
     pub class_binding: Pointer64<SchemaClassBinding>,
@@ -94,4 +97,17 @@ pub union SchemaTypeUnion {
     pub atomic_tf: SchemaAtomicTF,
     pub atomic_ttf: SchemaAtomicTTF,
     pub atomic_i: SchemaAtomicI,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_remote_schema_layout() {
+        assert_eq!(std::mem::offset_of!(SchemaType, type_category), 0x18);
+        assert_eq!(std::mem::offset_of!(SchemaType, atomic_category), 0x19);
+        assert_eq!(std::mem::offset_of!(SchemaType, value), 0x20);
+        assert_eq!(std::mem::size_of::<SchemaType>(), 0x48);
+    }
 }
